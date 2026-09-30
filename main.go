@@ -128,12 +128,13 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 						continue
 					}
 
-					if err := logTime(input.TaskID, input.Seconds); err != nil {
+					result, err := logTime(blockTyped.ID, input.TaskID, input.Seconds)
+					if err != nil {
 						toolResults = append(toolResults, toolError(blockTyped.ID, err))
 						continue
 					}
 
-					toolResults = append(toolResults, toolResultJSON(blockTyped.ID, map[string]string{"status": "success"}))
+					toolResults = append(toolResults, toolResultJSON(blockTyped.ID, result))
 				default:
 					toolResults = append(toolResults, toolError(blockTyped.ID, fmt.Errorf(
 						"Unknown tool %q. Use only the available tools: %s, %s",
@@ -241,21 +242,60 @@ func getTaskByTitle(title string) (Task, error) {
 	return Task{}, fmt.Errorf("no task matches %q. %s", title, availableTasks())
 }
 
+type logTimeResult struct {
+	Status       string `json:"status"`
+	TaskID       string `json:"task_id"`
+	LoggedNow    int    `json:"logged_seconds"`
+	TotalSeconds int    `json:"total_seconds"`
+}
+
+// applied is the idempotency ledger, keyed by tool_use.id. It stores the whole
+// result, not a flag, so a replay returns byte-identical output to the first
+// call — the model must not be able to tell a retry from the original.
+var applied = map[string]logTimeResult{}
+
 // logTime is the trust boundary. The JSON schema advertises "minimum": 1 to the
 // model, but the API does not enforce it — the schema is a hint, not validation.
 // Treat every field of tool_use.input as untrusted, exactly like an HTTP body.
-func logTime(taskID string, seconds int) error {
+//
+// It is also not naturally idempotent: it adds a delta, so applying it twice
+// double-counts. toolUseID is the idempotency key — it is unique per model
+// request and already travels with the call.
+//
+// This guards ONE of the two retries:
+//
+//	harness/transport replay — same tool_use.id, the ledger catches it. Covered.
+//	the model re-asking       — it never saw the result and issues a genuinely
+//	                            new call with a NEW tool_use.id. Nothing marks
+//	                            the two as the same intent, so the ledger never
+//	                            matches and the time is logged twice. NOT covered.
+//
+// The second case is unfixable by any key. It needs a declarative tool —
+// set_logged_time(task_id, total_seconds) instead of a delta — because setting
+// an absolute value is idempotent by construction. See RESULTS.md.
+func logTime(toolUseID, taskID string, seconds int) (logTimeResult, error) {
+	if prev, ok := applied[toolUseID]; ok {
+		fmt.Printf("        log  replay of %s ignored, total stays %ds\n", toolUseID, prev.TotalSeconds)
+		return prev, nil
+	}
 	if seconds <= 0 {
-		return fmt.Errorf("seconds must be a positive integer, got %d", seconds)
+		return logTimeResult{}, fmt.Errorf("seconds must be a positive integer, got %d", seconds)
 	}
 	for i := range tasks {
 		if tasks[i].ID == taskID {
 			tasks[i].Time += seconds
 			fmt.Printf("        log  +%ds to %q, total %ds\n", seconds, tasks[i].Title, tasks[i].Time)
-			return nil
+			result := logTimeResult{
+				Status:       "success",
+				TaskID:       taskID,
+				LoggedNow:    seconds,
+				TotalSeconds: tasks[i].Time,
+			}
+			applied[toolUseID] = result
+			return result, nil
 		}
 	}
-	return fmt.Errorf("no task with id %q. %s", taskID, availableTasks())
+	return logTimeResult{}, fmt.Errorf("no task with id %q. %s", taskID, availableTasks())
 }
 
 // availableTasks makes a failure self-correcting: the model sees every valid

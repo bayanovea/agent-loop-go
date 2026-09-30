@@ -42,7 +42,7 @@ Final-turn input is 1 130 tokens — that is the entire conversation plus tools 
 
 There are two distinct retries and they need different answers:
 
-1. **Harness or transport retry** — the same request is replayed, so `tool_use.id` is unchanged. Pass that id into `logTime`, keep a set of applied ids, and on a repeat return the current state instead of applying again. The id is the natural idempotency key: it is unique per model request and already travels with the call.
+1. **Harness or transport retry** — the same request is replayed, so `tool_use.id` is unchanged. Pass that id into `logTime`, keep a ledger of applied ids, and on a repeat return the stored result instead of applying again. The id is the natural idempotency key: it is unique per model request and already travels with the call. **Implemented** — the ledger stores the whole result rather than a flag, so a replay is byte-identical to the original and the model cannot tell the difference. Not exercised by the happy path; it is a guard, and it currently has no test.
 2. **The model re-asking** — it never saw the result and issues a genuinely new call, with a **new** `tool_use.id`. The key does not help here, because nothing marks the two calls as the same intent. The fix is to make the operation declarative: `set_logged_time(task_id, total_seconds)` instead of `log_time(task_id, delta)`. Setting an absolute value is idempotent by construction, and the invalid state stops being representable.
 
 Same lesson as the `swap_shift` exercise, inverted: that tool was dangerous because it was its own inverse, this one because it accumulates. Both are only safe once the *schema* makes the wrong call impossible rather than the handler catching it afterwards.
