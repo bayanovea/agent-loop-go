@@ -40,6 +40,10 @@ const (
 	model     = anthropic.ModelClaudeHaiku4_5
 	maxTokens = 4096
 	maxTurns  = 8
+
+	// Claude Haiku 4.5 list price, USD per million tokens.
+	inputPricePerMTok  = 1.0
+	outputPricePerMTok = 5.0
 )
 
 func main() {
@@ -62,6 +66,13 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 	}
 	tools := buildTools()
 
+	var totalIn, totalOut int64
+	defer func() {
+		fmt.Printf("\n---- usage ----\n  in=%d  out=%d  cost=$%.5f\n",
+			totalIn, totalOut,
+			float64(totalIn)/1e6*inputPricePerMTok+float64(totalOut)/1e6*outputPricePerMTok)
+	}()
+
 	for turn := 1; turn <= maxTurns; turn++ {
 		fmt.Printf("\n---- turn %d ----\n", turn)
 		fmt.Printf("  >>    %d message(s), model=%s, tools=%d\n", len(messages), model, len(tools))
@@ -80,9 +91,10 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 			fmt.Printf("  !!    request failed: %v\n", err)
 			return
 		}
-		fmt.Printf("[TOKEN DEBUG] Input tokens: %d, Output tokens: %d\n", message.Usage.InputTokens, message.Usage.OutputTokens)
-		fmt.Printf("  <<    stop=%s, tokens in=%d out=%d\n\n",
-			message.StopReason, message.Usage.InputTokens, message.Usage.OutputTokens)
+		totalIn += message.Usage.InputTokens
+		totalOut += message.Usage.OutputTokens
+		fmt.Printf("  <<    stop=%s, tokens in=%d out=%d (total in=%d out=%d)\n\n",
+			message.StopReason, message.Usage.InputTokens, message.Usage.OutputTokens, totalIn, totalOut)
 		messages = append(messages, message.ToParam())
 
 		toolResults := []anthropic.ContentBlockParamUnion{}
@@ -97,14 +109,13 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 					var input listTasksInput
 					if err := json.Unmarshal(blockTyped.Input, &input); err != nil {
 						toolResults = append(toolResults, toolError(blockTyped.ID, fmt.Errorf(
-							`Can't unmarshal json in input for block ID %s. Call again with a JSON object like {"query": "migration"}. Call again with a JSON object like {"query": "migration"}. Error: %w.`, blockTyped.ID, err)))
+							`invalid arguments: %w. Call again with a JSON object like {"query": "migration"}`, err)))
 						continue
 					}
 
 					task, err := getTaskByTitle(input.Query)
 					if err != nil {
-						toolResults = append(toolResults, toolError(blockTyped.ID, fmt.Errorf(
-							"Can't find task for for block ID %s by query '%s'. Error: %w", blockTyped.ID, input.Query, err)))
+						toolResults = append(toolResults, toolError(blockTyped.ID, err))
 						continue
 					}
 
@@ -113,13 +124,12 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 					var input logTimeInput
 					if err := json.Unmarshal(blockTyped.Input, &input); err != nil {
 						toolResults = append(toolResults, toolError(blockTyped.ID, fmt.Errorf(
-							`Can't unmarshal json in input for block ID %s. Call again with {"task_id": "<id>", "seconds": <integer>}. Error: %w.`, blockTyped.ID, err)))
+							`invalid arguments: %w. Call again with {"task_id": "<id>", "seconds": <positive integer>}`, err)))
 						continue
 					}
 
 					if err := logTime(input.TaskID, input.Seconds); err != nil {
-						toolResults = append(toolResults, toolError(blockTyped.ID, fmt.Errorf(
-							"Can't log time for for block ID %s and task ID %s. Try again with valid task ID. Error: %w", blockTyped.ID, input.TaskID, err)))
+						toolResults = append(toolResults, toolError(blockTyped.ID, err))
 						continue
 					}
 
@@ -221,17 +231,23 @@ func buildTools() []anthropic.ToolUnionParam {
 
 func getTaskByTitle(title string) (Task, error) {
 	if title == "" {
-		return Task{}, fmt.Errorf("empty title")
+		return Task{}, fmt.Errorf("query is empty. %s", availableTasks())
 	}
 	for _, task := range tasks {
 		if strings.Contains(strings.ToLower(task.Title), strings.ToLower(title)) {
 			return task, nil
 		}
 	}
-	return Task{}, fmt.Errorf("task %q not found", title)
+	return Task{}, fmt.Errorf("no task matches %q. %s", title, availableTasks())
 }
 
+// logTime is the trust boundary. The JSON schema advertises "minimum": 1 to the
+// model, but the API does not enforce it — the schema is a hint, not validation.
+// Treat every field of tool_use.input as untrusted, exactly like an HTTP body.
 func logTime(taskID string, seconds int) error {
+	if seconds <= 0 {
+		return fmt.Errorf("seconds must be a positive integer, got %d", seconds)
+	}
 	for i := range tasks {
 		if tasks[i].ID == taskID {
 			tasks[i].Time += seconds
@@ -239,7 +255,18 @@ func logTime(taskID string, seconds int) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("task with ID %q not found", taskID)
+	return fmt.Errorf("no task with id %q. %s", taskID, availableTasks())
+}
+
+// availableTasks makes a failure self-correcting: the model sees every valid
+// id and title in the error itself, so it can pick the right one or tell the
+// user the task does not exist, instead of retrying blind until maxTurns.
+func availableTasks() string {
+	parts := make([]string, len(tasks))
+	for i, task := range tasks {
+		parts[i] = fmt.Sprintf("%s=%q", task.ID, task.Title)
+	}
+	return "Available tasks: " + strings.Join(parts, ", ")
 }
 
 func toolResultJSON(toolUseID string, v any) anthropic.ContentBlockParamUnion {
