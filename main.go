@@ -128,7 +128,7 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 						continue
 					}
 
-					result, err := logTime(blockTyped.ID, input.TaskID, input.Seconds)
+					result, err := logTime(applied, blockTyped.ID, input.TaskID, input.Seconds)
 					if err != nil {
 						toolResults = append(toolResults, toolError(blockTyped.ID, err))
 						continue
@@ -148,7 +148,7 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 		switch message.StopReason {
 		case anthropic.StopReasonToolUse:
 			if len(toolResults) == 0 {
-				fmt.Printf("  !!    stop=tool_use, но ни один результат не собран\n")
+				fmt.Printf("  !!    stop=tool_use, but no tool result was collected\n")
 				return
 			}
 			fmt.Printf("\n  >>    returning %d tool result(s)\n", len(toolResults))
@@ -162,21 +162,21 @@ func runAgent(ctx context.Context, client *anthropic.Client, prompt string) {
 			fmt.Printf("\n  ..    paused, resending as is\n")
 
 		case anthropic.StopReasonMaxTokens:
-			fmt.Printf("  !!    ответ обрезан, упёрлись в MaxTokens=%d\n", maxTokens)
+			fmt.Printf("  !!    response truncated, hit MaxTokens=%d\n", maxTokens)
 			return
 
 		case anthropic.StopReasonRefusal:
-			fmt.Printf("  !!    отказ: category=%q %s\n",
+			fmt.Printf("  !!    refused: category=%q %s\n",
 				message.StopDetails.Category, message.StopDetails.Explanation)
 			return
 
 		default:
-			fmt.Printf("  !!    неожиданный stop_reason=%q\n", message.StopReason)
+			fmt.Printf("  !!    unexpected stop_reason=%q\n", message.StopReason)
 			return
 		}
 	}
 
-	fmt.Printf("\n---- остановлено: исчерпан бюджет в %d ход(ов) ----\n", maxTurns)
+	fmt.Printf("\n---- stopped: turn budget of %d exhausted ----\n", maxTurns)
 }
 
 func buildTools() []anthropic.ToolUnionParam {
@@ -260,7 +260,8 @@ var applied = map[string]logTimeResult{}
 //
 // It is also not naturally idempotent: it adds a delta, so applying it twice
 // double-counts. toolUseID is the idempotency key — it is unique per model
-// request and already travels with the call.
+// request and already travels with the call. The ledger is a parameter so the
+// replay path can be tested without touching the package-level map.
 //
 // This guards ONE of the two retries:
 //
@@ -273,8 +274,8 @@ var applied = map[string]logTimeResult{}
 // The second case is unfixable by any key. It needs a declarative tool —
 // set_logged_time(task_id, total_seconds) instead of a delta — because setting
 // an absolute value is idempotent by construction. See RESULTS.md.
-func logTime(toolUseID, taskID string, seconds int) (logTimeResult, error) {
-	if prev, ok := applied[toolUseID]; ok {
+func logTime(ledger map[string]logTimeResult, toolUseID, taskID string, seconds int) (logTimeResult, error) {
+	if prev, ok := ledger[toolUseID]; ok {
 		fmt.Printf("        log  replay of %s ignored, total stays %ds\n", toolUseID, prev.TotalSeconds)
 		return prev, nil
 	}
@@ -291,7 +292,7 @@ func logTime(toolUseID, taskID string, seconds int) (logTimeResult, error) {
 				LoggedNow:    seconds,
 				TotalSeconds: tasks[i].Time,
 			}
-			applied[toolUseID] = result
+			ledger[toolUseID] = result
 			return result, nil
 		}
 	}

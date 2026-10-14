@@ -1,6 +1,6 @@
 module github.com/bayanovea/agent-loop-go
 
-go 1.27.1
+go 1.24
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.76.0
